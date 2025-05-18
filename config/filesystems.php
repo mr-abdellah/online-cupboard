@@ -45,7 +45,6 @@ return [
 
         'local' => [
             'driver' => 'local',
-            // 'root' => '/home/abdellah/Desktop/ged/mount',
             'root' => storage_path('app/private'),
             'serve' => true,
             'throw' => false,

@@ -54,6 +54,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/users/{user}', [UserController::class, 'update']);
     Route::post('/users/{user}/deactivate', [UserController::class, 'deactivate']);
     Route::post('/users/{user}/activate', [UserController::class, 'activate']);
+    Route::delete('/users/{user}', [UserController::class, 'destroy']);
 
     // Document User Permissions APIs
     Route::post('/document/{document}/manage-permissions', [DocumentUserPermissionController::class, 'storeOrUpdate']);

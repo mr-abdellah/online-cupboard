@@ -510,7 +510,7 @@ class DocumentController extends Controller
                 $mimeType = 'application/octet-stream';
         }
     
-        $response = response()->file(storage_path('app/' . $document->path));
+        $response = response()->file(Storage::disk('local')->path($document->path));
         $response->setContentDisposition('inline', $document->title . '.' . $document->type);
         $response->headers->set('Content-Type', $mimeType);
         return $response;
