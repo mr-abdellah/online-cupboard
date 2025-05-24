@@ -68,9 +68,9 @@ class DocumentController extends Controller
 
             $hasManagePermission = $document->binder && $document->binder->cupboard
                 ? CupboardUserPermission::where('cupboard_id', $document->binder->cupboard->id)
-                    ->where('user_id', $userId)
-                    ->where('permission', 'manage')
-                    ->exists()
+                ->where('user_id', $userId)
+                ->where('permission', 'manage')
+                ->exists()
                 : false;
 
             $permissions = [];
@@ -109,9 +109,9 @@ class DocumentController extends Controller
         // Check if user has 'manage' permission on the cupboard
         $hasCupboardManagePermission = $document->binder && $document->binder->cupboard_id
             ? CupboardUserPermission::where('user_id', $userId)
-                ->where('cupboard_id', $document->binder->cupboard_id)
-                ->where('permission', 'manage')
-                ->exists()
+            ->where('cupboard_id', $document->binder->cupboard_id)
+            ->where('permission', 'manage')
+            ->exists()
             : false;
 
         // If no manage permission, return false immediately
@@ -180,7 +180,7 @@ class DocumentController extends Controller
             'title' => 'required|string|max:255',
             'description' => 'nullable|string',
             'binder_id' => 'required|uuid|exists:binders,id',
-            'file' => 'required|file|mimes:jpg,jpeg,png,pdf,doc,docx,xls,xlsx,ppt,pptx',
+            'file' => 'required|file', // Removed mimes restriction to allow all file types
             'is_searchable' => 'boolean',
             'tags' => 'nullable|array',
         ]);
@@ -203,97 +203,16 @@ class DocumentController extends Controller
         }
 
         $file = $request->file('file');
-        $extension = $file->getClientOriginalExtension();
+        $extension = strtolower($file->getClientOriginalExtension());
         $filename = uniqid() . '.' . $extension;
-        $subfolder = strtolower($extension);
+        $subfolder = $extension ? strtolower($extension) : 'unknown';
         $path = $file->storeAs($subfolder, $filename, 'local');
-
-        $tmpPath = storage_path('app/private/tmp');
-        if (!Storage::exists('private/tmp')) {
-            Storage::makeDirectory('private/tmp', 0755, true);
-        }
-
-        $fullPath = $tmpPath . '/' . uniqid() . '.' . $extension;
-        $file->move($tmpPath, basename($fullPath));
-
-        $ocrText = '';
-        $tempFiles = [];
-        try {
-            if (in_array($extension, ['jpg', 'jpeg', 'png'])) {
-                $ocrText = (new TesseractOCR($fullPath))->run();
-            } elseif ($extension === 'pdf') {
-                // Use Imagick to count pages
-                $imagick = new \Imagick($fullPath);
-                $pageCount = $imagick->getNumberImages();
-                $imagick->clear();
-                $imagick->destroy();
-
-                $pdf = new Pdf($fullPath);
-                $ocrTextParts = [];
-
-                for ($page = 1; $page <= $pageCount; $page++) {
-                    $imagePath = $tmpPath . '/' . uniqid() . '.jpg';
-                    $pdf->selectPage($page)->save($imagePath);
-                    $ocrTextParts[] = (new TesseractOCR($imagePath))->run();
-                    $tempFiles[] = $imagePath; // Track for cleanup
-                }
-
-                $ocrText = implode("\n", array_filter($ocrTextParts));
-            } elseif (in_array($extension, ['doc', 'docx'])) {
-                $phpWord = PhpWordIOFactory::load($fullPath);
-                $text = '';
-                foreach ($phpWord->getSections() as $section) {
-                    foreach ($section->getElements() as $element) {
-                        if (method_exists($element, 'getText')) {
-                            $text .= $element->getText() . "\n";
-                        }
-                    }
-                }
-                $ocrText = trim($text);
-            } elseif (in_array($extension, ['xls', 'xlsx'])) {
-                $spreadsheet = SpreadsheetIOFactory::load($fullPath);
-                $text = '';
-                foreach ($spreadsheet->getAllSheets() as $sheet) {
-                    foreach ($sheet->toArray(null, true, true, true) as $row) {
-                        $text .= implode(' ', array_filter($row, fn($cell) => !is_null($cell))) . "\n";
-                    }
-                }
-                $ocrText = trim($text);
-            } elseif (in_array($extension, ['ppt', 'pptx'])) {
-                $presentation = PresentationIOFactory::load($fullPath);
-                $text = '';
-                foreach ($presentation->getAllSlides() as $slide) {
-                    foreach ($slide->getShapeCollection() as $shape) {
-                        if (method_exists($shape, 'getText')) {
-                            $text .= $shape->getText() . "\n";
-                        } elseif (method_exists($shape, 'getRichTextElements')) {
-                            foreach ($shape->getRichTextElements() as $element) {
-                                if (method_exists($element, 'getText')) {
-                                    $text .= $element->getText() . "\n";
-                                }
-                            }
-                        }
-                    }
-                }
-                $ocrText = trim($text);
-            }
-        } catch (\Exception $e) {
-            $ocrText = '';
-            Log::error('OCR extraction failed: ' . $e->getMessage());
-        } finally {
-            Storage::delete($fullPath);
-            foreach ($tempFiles as $tempFile) {
-                if (Storage::exists($tempFile)) {
-                    Storage::delete($tempFile);
-                }
-            }
-        }
 
         $document = Document::create([
             'title' => $validated['title'],
             'description' => $validated['description'] ?? null,
-            'type' => $extension,
-            'ocr' => $ocrText,
+            'type' => $extension ?: 'unknown',
+            'ocr' => '',
             'tags' => $validated['tags'] ?? [],
             'binder_id' => $validated['binder_id'],
             'path' => $path,
@@ -468,56 +387,97 @@ class DocumentController extends Controller
         }
     }
 
+    private function convertToPdf(Document $document): ?string
+    {
+        $storagePath = Storage::disk('local')->path($document->path);
+        $outputDir = dirname($storagePath);
+
+        if (!file_exists($storagePath)) {
+            \Log::error("Input file not found: $storagePath");
+            return null;
+        }
+
+        $soffice = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN'
+            ? '"C:\\Program Files\\LibreOffice\\program\\soffice.exe"'
+            : '/Applications/LibreOffice.app/Contents/MacOS/soffice';
+
+        if (!is_dir($outputDir) || !is_writable($outputDir)) {
+            \Log::error("Output directory not writable or does not exist: $outputDir");
+            return null;
+        }
+
+        if (!file_exists($soffice) && strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
+            \Log::error("LibreOffice soffice not found at: $soffice");
+            return null;
+        }
+
+        $baseName = pathinfo($storagePath, PATHINFO_FILENAME) . '.pdf';
+        $convertedPath = $outputDir . DIRECTORY_SEPARATOR . $baseName;
+
+        // Optional: Improve headless rendering compatibility
+        putenv('SAL_USE_VCLPLUGIN=gen');
+
+        // Simplified conversion command with default PDF export
+        $command = "$soffice --headless --convert-to pdf:calc_pdf_Export --outdir \"$outputDir\" \"$storagePath\" 2>&1";
+        exec($command, $output, $code);
+
+        if ($code !== 0) {
+            \Log::error("PDF conversion failed: Command: $command");
+            \Log::error("Output: " . implode("\n", $output));
+            \Log::error("Exit Code: $code");
+            return null;
+        }
+
+        if (!file_exists($convertedPath)) {
+            \Log::error("PDF file not found at: $convertedPath");
+            return null;
+        }
+
+        return str_replace(Storage::disk('local')->getDriver()->getAdapter()->getPathPrefix(), '', $convertedPath);
+    }
+
+
     public function display(Document $document)
     {
         if ($document->is_public === false && !auth()->user()->hasDocumentPermission($document, 'view')) {
             return response()->json(['error' => 'You don’t have permission'], 403);
         }
+
         if (!Storage::disk('local')->exists($document->path)) {
             return response()->json(['error' => 'File not found'], 404);
         }
-    
-        switch ($document->type) {
-            case 'jpg':
-            case 'jpeg':
-                $mimeType = 'image/jpeg';
-                break;
-            case 'png':
-                $mimeType = 'image/png';
-                break;
-            case 'pdf':
-                $mimeType = 'application/pdf';
-                break;
-            case 'doc':
-                $mimeType = 'application/msword';
-                break;
-            case 'docx':
-                $mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-                break;
-            case 'xls':
-                $mimeType = 'application/vnd.ms-excel';
-                break;
-            case 'xlsx':
-                $mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-                break;
-            case 'ppt':
-                $mimeType = 'application/vnd.ms-powerpoint';
-                break;
-            case 'pptx':
-                $mimeType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
-                break;
-            default:
-                $mimeType = 'application/octet-stream';
+
+        $officeTypes = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
+        if (in_array($document->type, $officeTypes)) {
+            $pdfPath = $this->convertToPdf($document);
+            if (!$pdfPath) {
+                return response()->json(['error' => 'Failed to convert to PDF'], 500);
+            }
+            $fullPath = Storage::disk('local')->path($pdfPath);
+            if (!file_exists($fullPath)) {
+                \Log::error("Converted PDF not found: $fullPath");
+                return response()->json(['error' => 'PDF file not found'], 404);
+            }
+            return response()->file($fullPath, ['Content-Type' => 'application/pdf']);
         }
-    
-        $response = response()->file(Storage::disk('local')->path($document->path));
+
+        $mimeTypes = [
+            'jpg' => 'image/jpeg',
+            'jpeg' => 'image/jpeg',
+            'png' => 'image/png',
+            'pdf' => 'application/pdf',
+        ];
+
+        $mimeType = $mimeTypes[$document->type] ?? 'application/octet-stream';
+        $filePath = Storage::disk('local')->path($document->path);
+
+        $response = response()->file($filePath);
         $response->setContentDisposition('inline', $document->title . '.' . $document->type);
         $response->headers->set('Content-Type', $mimeType);
+
         return $response;
-        
     }
-    
-    
+
 
     public function download(Document $document)
     {
@@ -527,7 +487,7 @@ class DocumentController extends Controller
         if (!Storage::disk('local')->exists($document->path)) {
             return response()->json(['error' => 'File not found'], 404);
         }
-    
+
         switch ($document->type) {
             case 'jpg':
             case 'jpeg':
@@ -560,13 +520,13 @@ class DocumentController extends Controller
             default:
                 $mimeType = 'application/octet-stream';
         }
-    
+
         return Storage::disk('local')->response($document->path, $document->title . '.' . $document->type, [
             'Content-Type' => $mimeType,
             'Content-Disposition' => 'attachment; filename="' . $document->title . '.' . $document->type . '"',
         ]);
     }
-    
+
 
     // Helper function to convert bytes to human-readable format
     private function formatBytes($bytes, $precision = 2)
