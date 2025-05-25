@@ -414,11 +414,11 @@ class DocumentController extends Controller
         $baseName = pathinfo($storagePath, PATHINFO_FILENAME) . '.pdf';
         $convertedPath = $outputDir . DIRECTORY_SEPARATOR . $baseName;
 
-        // Optional: Improve headless rendering compatibility
+        // Set environment variable for headless compatibility
         putenv('SAL_USE_VCLPLUGIN=gen');
 
-        // Simplified conversion command with default PDF export
-        $command = "$soffice --headless --convert-to pdf:calc_pdf_Export --outdir \"$outputDir\" \"$storagePath\" 2>&1";
+        // Generic conversion command to handle all file types
+        $command = "$soffice --headless --convert-to pdf --outdir \"$outputDir\" \"$storagePath\" 2>&1";
         exec($command, $output, $code);
 
         if ($code !== 0) {
@@ -447,8 +447,10 @@ class DocumentController extends Controller
             return response()->json(['error' => 'File not found'], 404);
         }
 
-        $officeTypes = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
-        if (in_array($document->type, $officeTypes)) {
+        $imageTypes = ['jpg', 'jpeg', 'png'];
+        $pdfTypes = ['pdf'];
+
+        if (!in_array($document->type, array_merge($imageTypes, $pdfTypes))) {
             $pdfPath = $this->convertToPdf($document);
             if (!$pdfPath) {
                 return response()->json(['error' => 'Failed to convert to PDF'], 500);
