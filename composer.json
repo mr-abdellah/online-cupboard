@@ -14,8 +14,8 @@
         "laravel/sanctum": "2.15",
         "laravel/tinker": "^2.7",
         "phpoffice/phppresentation": "^0.9",
-        "phpoffice/phpspreadsheet": "^1.18",
-        "phpoffice/phpword": "^0.17",
+        "phpoffice/phpspreadsheet": "^1.29",
+        "phpoffice/phpword": "^0.18",
         "spatie/laravel-permission": "^5.5",
         "spatie/pdf-to-image": "^2.0",
         "thiagoalessio/tesseract_ocr": "^2.13"

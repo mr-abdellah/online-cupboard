@@ -95,4 +95,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/documents/{document}/display', [DocumentController::class, 'display']);
     Route::put('/documents/{document}/change-binder', [DocumentController::class, 'changeBinder']);
     Route::post('/documents/{documentId}/copy-to-binders', [DocumentController::class, 'copyToBinders']);
+
+    // serve files
+    Route::get('/storage/converted/{filename}', [DocumentController::class, 'serveConvertedFile']);
 });

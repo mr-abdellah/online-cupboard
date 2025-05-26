@@ -16,9 +16,33 @@ use thiagoalessio\TesseractOCR\TesseractOCR;
 use PhpOffice\PhpWord\IOFactory as PhpWordIOFactory;
 use PhpOffice\PhpSpreadsheet\IOFactory as SpreadsheetIOFactory;
 use PhpOffice\PhpPresentation\IOFactory as PresentationIOFactory;
+use Symfony\Component\Mime\MimeTypes;
 
 class DocumentController extends Controller
 {
+
+    private const CONVERTIBLE_TYPES = [
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.ms-powerpoint',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'text/csv',
+        'application/vnd.oasis.opendocument.text',
+        'application/vnd.oasis.opendocument.spreadsheet',
+        'application/vnd.oasis.opendocument.presentation'
+    ];
+
+    private const VIEWABLE_TYPES = [
+        'application/pdf',
+        'image/jpeg',
+        'image/png',
+        'image/gif',
+        'image/webp',
+        'image/svg+xml',
+        'text/plain'
+    ];
 
     public function searchDocuments(Request $request)
     {
@@ -387,99 +411,582 @@ class DocumentController extends Controller
         }
     }
 
-    private function convertToPdf(Document $document): ?string
+
+    /**
+     * Enhanced PDF conversion with better Excel handling
+     */
+    private function convertToPdf(Document $document, string $mimeType): ?string
     {
-        $storagePath = Storage::disk('local')->path($document->path);
-        $outputDir = dirname($storagePath);
+        $inputPath = Storage::disk('local')->path($document->path);
+        $cacheKey = md5($document->path . $document->updated_at);
+        $cacheDir = storage_path('app/pdf_cache');
+        $cachedPdf = "$cacheDir/{$cacheKey}.pdf";
 
-        if (!file_exists($storagePath)) {
-            \Log::error("Input file not found: $storagePath");
-            return null;
+        // Return cached version if exists
+        if (file_exists($cachedPdf)) {
+            Log::info("Using cached PDF", ['cache_file' => $cachedPdf]);
+            return $cachedPdf;
         }
 
-        $soffice = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN'
-            ? '"C:\\Program Files\\LibreOffice\\program\\soffice.exe"'
-            : '/Applications/LibreOffice.app/Contents/MacOS/soffice';
-
-        if (!is_dir($outputDir) || !is_writable($outputDir)) {
-            \Log::error("Output directory not writable or does not exist: $outputDir");
-            return null;
+        // Ensure cache directory exists
+        if (!is_dir($cacheDir)) {
+            mkdir($cacheDir, 0755, true);
         }
 
-        if (!file_exists($soffice) && strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
-            \Log::error("LibreOffice soffice not found at: $soffice");
+        $tempDir = storage_path('app/temp/' . uniqid());
+
+        try {
+            // Create temp directory
+            if (!mkdir($tempDir, 0755, true)) {
+                throw new \RuntimeException("Failed to create temp directory: $tempDir");
+            }
+
+            $success = false;
+
+            // Try different conversion methods based on file type
+            if ($this->isExcelFile($mimeType)) {
+                $success = $this->convertExcelToPdf($inputPath, $tempDir, $cachedPdf);
+            } else {
+                $success = $this->convertOfficeToPdf($inputPath, $tempDir, $cachedPdf);
+            }
+
+            if (!$success || !file_exists($cachedPdf)) {
+                Log::error("Conversion failed", [
+                    'input_path' => $inputPath,
+                    'mime_type' => $mimeType,
+                    'cache_file' => $cachedPdf
+                ]);
+                return null;
+            }
+
+            Log::info("Document converted successfully", [
+                'input_path' => $inputPath,
+                'output_path' => $cachedPdf,
+                'file_size' => filesize($cachedPdf)
+            ]);
+
+            return $cachedPdf;
+        } catch (\Throwable $e) {
+            Log::error("Conversion error", [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
             return null;
+        } finally {
+            $this->removeDirectory($tempDir);
         }
-
-        $baseName = pathinfo($storagePath, PATHINFO_FILENAME) . '.pdf';
-        $convertedPath = $outputDir . DIRECTORY_SEPARATOR . $baseName;
-
-        // Set environment variable for headless compatibility
-        putenv('SAL_USE_VCLPLUGIN=gen');
-
-        // Generic conversion command to handle all file types
-        $command = "$soffice --headless --convert-to pdf --outdir \"$outputDir\" \"$storagePath\" 2>&1";
-        exec($command, $output, $code);
-
-        if ($code !== 0) {
-            \Log::error("PDF conversion failed: Command: $command");
-            \Log::error("Output: " . implode("\n", $output));
-            \Log::error("Exit Code: $code");
-            return null;
-        }
-
-        if (!file_exists($convertedPath)) {
-            \Log::error("PDF file not found at: $convertedPath");
-            return null;
-        }
-
-        return str_replace(Storage::disk('local')->getDriver()->getAdapter()->getPathPrefix(), '', $convertedPath);
     }
 
+    /**
+     * Enhanced Excel to PDF conversion with better fidelity for wide sheets
+     */
+    private function convertExcelToPdf(string $inputPath, string $tempDir, string $outputPath): bool
+    {
+        $isWindows = PHP_OS_FAMILY === 'Windows';
+
+        // Method 1: Try macro-based conversion (best for wide sheets)
+        if ($this->convertExcelWithMacro($inputPath, $tempDir, $outputPath, $isWindows)) {
+            return true;
+        }
+
+        // Method 2: Try print-to-PDF approach
+        if ($this->convertExcelWithPrint($inputPath, $tempDir, $outputPath, $isWindows)) {
+            return true;
+        }
+
+        // Method 3: Fallback to basic conversion
+        return $this->convertOfficeToPdf($inputPath, $tempDir, $outputPath);
+    }
+
+    /**
+     * Convert Excel using macro to control page layout
+     */
+    private function convertExcelWithMacro(string $inputPath, string $tempDir, string $outputPath, bool $isWindows): bool
+    {
+        $soffice = $this->getLibreOfficePath($isWindows);
+        if (!$soffice) {
+            return false;
+        }
+
+        $loProfile = "$tempDir/libreoffice_macro";
+        mkdir($loProfile, 0755, true);
+
+        // Create macro file to handle wide Excel sheets
+        $macroContent = $this->createExcelScalingMacro();
+        $macroFile = "$loProfile/ExcelMacro.bas";
+        file_put_contents($macroFile, $macroContent);
+
+        // Step 1: Convert to ODS first (this preserves more formatting)
+        $odsFile = "$tempDir/temp.ods";
+        $step1Command = sprintf(
+            '%s --headless --convert-to ods --outdir %s %s',
+            $soffice,
+            escapeshellarg($tempDir),
+            escapeshellarg($inputPath)
+        );
+
+        exec($step1Command, $output1, $code1);
+
+        if ($code1 !== 0 || !file_exists($odsFile)) {
+            return false;
+        }
+
+        // Step 2: Use macro to scale and convert to PDF
+        $step2Command = sprintf(
+            '%s --headless --invisible --calc --run-macro %s --convert-to pdf --outdir %s %s',
+            $soffice,
+            escapeshellarg($macroFile),
+            escapeshellarg($tempDir),
+            escapeshellarg($odsFile)
+        );
+
+        exec($step2Command, $output2, $code2);
+
+        // Find converted PDF
+        $convertedFiles = glob("$tempDir/*.pdf");
+        if (!empty($convertedFiles)) {
+            $tempPdf = reset($convertedFiles);
+            if (file_exists($tempPdf) && filesize($tempPdf) > 500) {
+                return rename($tempPdf, $outputPath);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Convert Excel using print approach for better scaling
+     */
+    private function convertExcelWithPrint(string $inputPath, string $tempDir, string $outputPath, bool $isWindows): bool
+    {
+        $soffice = $this->getLibreOfficePath($isWindows);
+        if (!$soffice) {
+            return false;
+        }
+
+        $loProfile = "$tempDir/libreoffice_print";
+        mkdir($loProfile, 0755, true);
+
+        // Use calc with print settings that force fit-to-page
+        $command = sprintf(
+            '%s --headless --calc --print-to-file --printer-name "Microsoft Print to PDF" --outdir %s %s',
+            $soffice,
+            escapeshellarg($tempDir),
+            escapeshellarg($inputPath)
+        );
+
+        // For non-Windows, use different approach
+        if (!$isWindows) {
+            $command = sprintf(
+                '%s --headless --calc --convert-to pdf:calc_pdf_Export --outdir %s %s',
+                $soffice,
+                escapeshellarg($tempDir),
+                escapeshellarg($inputPath)
+            );
+        }
+
+        $env = [
+            'HOME' => $loProfile,
+            'TMPDIR' => $tempDir,
+        ];
+
+        if (!$isWindows) {
+            $env['SHELL'] = '/bin/bash';
+        }
+
+        exec($command, $output, $exitCode);
+
+        Log::info("Excel print conversion attempt", [
+            'command' => $command,
+            'exit_code' => $exitCode,
+            'output' => implode("\n", $output)
+        ]);
+
+        $convertedFiles = glob("$tempDir/*.pdf");
+        if (!empty($convertedFiles)) {
+            $tempPdf = reset($convertedFiles);
+            if (file_exists($tempPdf) && filesize($tempPdf) > 500) {
+                return rename($tempPdf, $outputPath);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Create macro content for Excel scaling
+     */
+    private function createExcelScalingMacro(): string
+    {
+        return '
+Sub ScaleExcelToPDF
+    Dim oDoc As Object
+    Dim oSheet As Object
+    Dim oPageStyle As Object
+    Dim i As Integer
+    
+    oDoc = ThisComponent
+    
+    For i = 0 To oDoc.getSheets().getCount() - 1
+        oSheet = oDoc.getSheets().getByIndex(i)
+        
+        \' Set print area to include all used cells
+        oUsedRange = oSheet.getCellRangeByName("A1").getSpreadsheet().getCellRangeByName(oSheet.getCellRangeByName("A1").getSpreadsheet().createCursor().getRangeAddress().toString())
+        
+        \' Get page style for this sheet
+        oPageStyle = oDoc.getStyleFamilies().getByName("PageStyles").getByName("Default")
+        
+        \' Force landscape orientation for wide sheets
+        oPageStyle.IsLandscape = True
+        
+        \' Set scaling to fit all columns on one page
+        oPageStyle.ScaleToPages = 0
+        oPageStyle.ScaleToPagesX = 1
+        oPageStyle.ScaleToPagesY = 0
+        
+        \' Reduce margins to maximize space
+        oPageStyle.LeftMargin = 500   \' 0.5cm
+        oPageStyle.RightMargin = 500
+        oPageStyle.TopMargin = 500
+        oPageStyle.BottomMargin = 500
+        
+    Next i
+End Sub
+';
+    }
+
+    /**
+     * LibreOffice Excel conversion with WORKING fit-to-page approach
+     */
+    private function convertExcelWithLibreOffice(string $inputPath, string $tempDir, string $outputPath, bool $isWindows): bool
+    {
+        $loProfile = "$tempDir/libreoffice_profile";
+        mkdir($loProfile, 0755, true);
+
+        $soffice = $this->getLibreOfficePath($isWindows);
+        if (!$soffice) {
+            Log::warning("LibreOffice not found");
+            return false;
+        }
+
+        // SIMPLE approach that actually works - force A4 landscape with scaling
+        $command = sprintf(
+            '%s --headless --invisible --nologo --calc ' .
+                '--convert-to pdf --outdir %s %s',
+            $soffice,
+            escapeshellarg($tempDir),
+            escapeshellarg($inputPath)
+        );
+
+        // Set environment to force specific print settings
+        $env = [
+            'HOME' => $loProfile,
+            'TMPDIR' => $tempDir,
+            // These are the key settings that actually work
+            'SAL_USE_VCLPLUGIN' => 'svp',  // Use headless plugin
+            'LIBREOFFICE_PRINT_FITTOPAGE' => '1',  // Force fit to page
+        ];
+
+        if (!$isWindows) {
+            $env['SHELL'] = '/bin/bash';
+            $env['DISPLAY'] = ':99';  // Dummy display
+        }
+
+        Log::info("Excel conversion attempt", [
+            'command' => $command,
+            'env_vars' => $env
+        ]);
+
+        // Execute with environment variables
+        $descriptorspec = [
+            0 => ["pipe", "r"],
+            1 => ["pipe", "w"],
+            2 => ["pipe", "w"]
+        ];
+
+        $process = proc_open($command, $descriptorspec, $pipes, null, $env);
+
+        if (is_resource($process)) {
+            fclose($pipes[0]);
+            $stdout = stream_get_contents($pipes[1]);
+            $stderr = stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $exitCode = proc_close($process);
+
+            Log::info("LibreOffice execution result", [
+                'exit_code' => $exitCode,
+                'stdout' => $stdout,
+                'stderr' => $stderr
+            ]);
+
+            if ($exitCode === 0) {
+                $convertedFiles = glob("$tempDir/*.pdf");
+                if (!empty($convertedFiles)) {
+                    $tempPdf = reset($convertedFiles);
+                    if (file_exists($tempPdf) && filesize($tempPdf) > 1000) {
+                        return rename($tempPdf, $outputPath);
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Standard Office document conversion
+     */
+    private function convertOfficeToPdf(string $inputPath, string $tempDir, string $outputPath): bool
+    {
+        $isWindows = PHP_OS_FAMILY === 'Windows';
+        $soffice = $this->getLibreOfficePath($isWindows);
+
+        if (!$soffice) {
+            return false;
+        }
+
+        $loProfile = "$tempDir/libreoffice_profile";
+        mkdir($loProfile, 0755, true);
+
+        $command = sprintf(
+            '%s --headless --convert-to pdf --outdir %s %s',
+            $soffice,
+            escapeshellarg($tempDir),
+            escapeshellarg($inputPath)
+        );
+
+        $env = [
+            'HOME' => $loProfile,
+            'TMPDIR' => $tempDir,
+        ];
+
+        if (!$isWindows) {
+            $env['SHELL'] = '/bin/bash';
+        }
+
+        exec($command, $output, $exitCode);
+
+        $convertedFiles = glob("$tempDir/*.pdf");
+        if (!empty($convertedFiles)) {
+            $tempPdf = reset($convertedFiles);
+            return rename($tempPdf, $outputPath);
+        }
+
+        return false;
+    }
+
+    /**
+     * Get LibreOffice executable path
+     */
+    private function getLibreOfficePath(bool $isWindows): ?string
+    {
+        if ($isWindows) {
+            $paths = [
+                'C:\Program Files\LibreOffice\program\soffice.exe',
+                'C:\Program Files (x86)\LibreOffice\program\soffice.exe',
+            ];
+        } else {
+            $paths = [
+                '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+                '/usr/bin/libreoffice',
+                '/usr/bin/soffice',
+                '/opt/libreoffice/program/soffice',
+            ];
+        }
+
+        foreach ($paths as $path) {
+            if (file_exists($path)) {
+                return $isWindows ? "\"$path\"" : $path;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Handle convertible document types
+     */
+    private function handleConvertibleDocument(Document $document, string $mimeType)
+    {
+        $pdfPath = $this->convertToPdf($document, $mimeType);
+
+        if (!$pdfPath || !file_exists($pdfPath)) {
+            Log::error("Failed to convert document", [
+                'document_id' => $document->id,
+                'mime_type' => $mimeType
+            ]);
+            return response()->json(['error' => 'Failed to convert document'], 500);
+        }
+
+        return $this->serveFile(
+            $pdfPath,
+            'application/pdf',
+            pathinfo($document->title, PATHINFO_FILENAME) . '.pdf'
+        );
+    }
+
+    /**
+     * Serve file with proper headers and security
+     */
+    private function serveFile(string $filePath, string $mimeType, string $filename)
+    {
+        if (!file_exists($filePath)) {
+            return response()->json(['error' => 'File not found'], 404);
+        }
+
+        $headers = [
+            'Content-Type' => $mimeType,
+            'Content-Length' => filesize($filePath),
+            'Content-Disposition' => 'inline; filename="' . basename($filename) . '"',
+            'Cache-Control' => 'private, max-age=3600',
+            'X-Content-Type-Options' => 'nosniff',
+            'X-Frame-Options' => 'SAMEORIGIN',
+        ];
+
+        return response()->file($filePath, $headers);
+    }
+
+    /**
+     * Check if user can view document
+     */
+    private function canViewDocument(Document $document): bool
+    {
+        if ($document->is_public) {
+            return true;
+        }
+
+        if (!auth()->check()) {
+            return false;
+        }
+
+        return auth()->user()->hasDocumentPermission($document, 'view');
+    }
+
+    /**
+     * Detect MIME type with fallback
+     */
+    private function detectMimeType(string $filePath): string
+    {
+        $mimeTypes = new MimeTypes();
+        $mimeType = $mimeTypes->guessMimeType($filePath);
+
+        // Fallback for common extensions
+        if (!$mimeType) {
+            $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+            $extensionMap = [
+                'doc' => 'application/msword',
+                'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                'xls' => 'application/vnd.ms-excel',
+                'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'ppt' => 'application/vnd.ms-powerpoint',
+                'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                'pdf' => 'application/pdf',
+                'jpg' => 'image/jpeg',
+                'jpeg' => 'image/jpeg',
+                'png' => 'image/png',
+                'gif' => 'image/gif',
+            ];
+
+            $mimeType = $extensionMap[$extension] ?? 'application/octet-stream';
+        }
+
+        return $mimeType;
+    }
+
+    /**
+     * Check if file is Excel format
+     */
+    private function isExcelFile(string $mimeType): bool
+    {
+        return in_array($mimeType, [
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'text/csv'
+        ]);
+    }
+
+    /**
+     * Safe recursive directory removal
+     */
+    private function removeDirectory(string $dir): void
+    {
+        if (!file_exists($dir)) {
+            return;
+        }
+
+        try {
+            $files = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+                \RecursiveIteratorIterator::CHILD_FIRST
+            );
+
+            foreach ($files as $file) {
+                if ($file->isDir()) {
+                    rmdir($file->getRealPath());
+                } else {
+                    unlink($file->getRealPath());
+                }
+            }
+            rmdir($dir);
+        } catch (\Exception $e) {
+            Log::warning("Failed to remove directory: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Clean old cached PDFs (call this periodically)
+     */
+    public function cleanPdfCache(): void
+    {
+        $cacheDir = storage_path('app/pdf_cache');
+        if (!is_dir($cacheDir)) {
+            return;
+        }
+
+        $files = glob("$cacheDir/*.pdf");
+        $maxAge = 7 * 24 * 3600; // 7 days
+
+        foreach ($files as $file) {
+            if (filemtime($file) < time() - $maxAge) {
+                unlink($file);
+            }
+        }
+    }
 
     public function display(Document $document)
     {
-        if ($document->is_public === false && !auth()->user()->hasDocumentPermission($document, 'view')) {
-            return response()->json(['error' => 'You don’t have permission'], 403);
+        // Security check
+        if (!$this->canViewDocument($document)) {
+            return response()->json(['error' => 'Unauthorized'], 403);
         }
 
+        // Check if file exists
         if (!Storage::disk('local')->exists($document->path)) {
             return response()->json(['error' => 'File not found'], 404);
         }
 
-        $imageTypes = ['jpg', 'jpeg', 'png'];
-        $pdfTypes = ['pdf'];
+        $fullPath = Storage::disk('local')->path($document->path);
+        $mimeType = $this->detectMimeType($fullPath);
 
-        if (!in_array($document->type, array_merge($imageTypes, $pdfTypes))) {
-            $pdfPath = $this->convertToPdf($document);
-            if (!$pdfPath) {
-                return response()->json(['error' => 'Failed to convert to PDF'], 500);
-            }
-            $fullPath = Storage::disk('local')->path($pdfPath);
-            if (!file_exists($fullPath)) {
-                \Log::error("Converted PDF not found: $fullPath");
-                return response()->json(['error' => 'PDF file not found'], 404);
-            }
-            return response()->file($fullPath, ['Content-Type' => 'application/pdf']);
+        Log::info("Document display request", [
+            'document_id' => $document->id,
+            'mime_type' => $mimeType,
+            'path' => $document->path
+        ]);
+
+        // Handle convertible documents
+        if (in_array($mimeType, self::CONVERTIBLE_TYPES)) {
+            return $this->handleConvertibleDocument($document, $mimeType);
         }
 
-        $mimeTypes = [
-            'jpg' => 'image/jpeg',
-            'jpeg' => 'image/jpeg',
-            'png' => 'image/png',
-            'pdf' => 'application/pdf',
-        ];
+        // Handle directly viewable documents
+        if (in_array($mimeType, self::VIEWABLE_TYPES)) {
+            return $this->serveFile($fullPath, $mimeType, $document->title);
+        }
 
-        $mimeType = $mimeTypes[$document->type] ?? 'application/octet-stream';
-        $filePath = Storage::disk('local')->path($document->path);
-
-        $response = response()->file($filePath);
-        $response->setContentDisposition('inline', $document->title . '.' . $document->type);
-        $response->headers->set('Content-Type', $mimeType);
-
-        return $response;
+        return response()->json(['error' => 'Unsupported file type for preview'], 415);
     }
-
 
     public function download(Document $document)
     {
