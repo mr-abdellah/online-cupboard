@@ -14,6 +14,8 @@ class PermissionSeeder extends Seeder
     public function run(): void
     {
         $permissions = [
+            'can_view_workspaces',
+            'can_create_workspaces',
             'can_view_documents',
             'can_edit_documents',
             'can_delete_document',

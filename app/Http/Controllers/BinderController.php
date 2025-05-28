@@ -7,6 +7,7 @@ use App\Models\CupboardUserPermission;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class BinderController extends Controller
 {
@@ -18,6 +19,7 @@ class BinderController extends Controller
     public function store(Request $request)
     {
         if (!auth()->user()->hasGlobalPermission('can_upload_documents')) {
+            Log::warning('Permission denied: can_upload_documents', ['user_id' => auth()->id()]);
             return response()->json([
                 'error' => "You don't have permission"
             ], 403);
@@ -35,19 +37,38 @@ class BinderController extends Controller
             ->exists();
 
         if (!$hasManagePermission) {
+            Log::warning('Permission denied: manage cupboard', [
+                'user_id' => $userId,
+                'cupboard_id' => $validated['cupboard_id'],
+            ]);
             return response()->json([
                 'error' => "You don't have permission to manage this cupboard"
             ], 403);
         }
 
+        $order = $validated['order'] ?? (Binder::where('cupboard_id', $validated['cupboard_id'])->max('order') + 1);
+
+        Log::info('Creating binder', [
+            'user_id' => $userId,
+            'cupboard_id' => $validated['cupboard_id'],
+            'name' => $validated['name'],
+            'order' => $order,
+        ]);
+
         $binder = Binder::create([
             'name' => $validated['name'],
             'cupboard_id' => $validated['cupboard_id'],
-            'order' => $validated['order'] ?? Binder::where('cupboard_id', $validated['cupboard_id'])->max('order') + 1,
+            'order' => $order,
+        ]);
+
+        Log::info('Binder created successfully', [
+            'binder_id' => $binder->id,
+            'user_id' => $userId,
         ]);
 
         return response()->json($binder, 201);
     }
+
 
     public function show(Binder $binder)
     {
@@ -128,5 +149,4 @@ class BinderController extends Controller
 
         return response()->json($binder);
     }
-
 }

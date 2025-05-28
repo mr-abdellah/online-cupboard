@@ -6,20 +6,15 @@ use Illuminate\Support\Facades\Schema;
 
 class CreateWorkspaceUserPermissionsTable extends Migration
 {
-    /**
-     * Run the migrations.
-     *
-     * @return void
-     */
     public function up()
     {
         Schema::create('workspace_user_permissions', function (Blueprint $table) {
-            $table->uuid('workspace_id');
+            $table->uuid('workspace_id')->nullable();
             $table->uuid('user_id');
-            $table->string('permission'); // e.g., 'read', 'write', 'admin', 'owner'
+            $table->string('permission');
             $table->timestamps();
 
-            $table->primary(['workspace_id', 'user_id', 'permission']);
+            $table->primary(['workspace_id', 'user_id', 'permission'], 'wup_primary');
             $table->foreign('workspace_id')->references('id')->on('workspaces')->onDelete('cascade');
             $table->foreign('user_id')->references('id')->on('users')->onDelete('cascade');
 
@@ -28,11 +23,6 @@ class CreateWorkspaceUserPermissionsTable extends Migration
         });
     }
 
-    /**
-     * Reverse the migrations.
-     *
-     * @return void
-     */
     public function down()
     {
         Schema::dropIfExists('workspace_user_permissions');

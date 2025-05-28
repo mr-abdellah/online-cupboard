@@ -6,6 +6,7 @@ use App\Models\Binder;
 use App\Models\CupboardUserPermission;
 use App\Models\Document;
 use App\Models\DocumentUserPermission;
+use App\Models\Workspace;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -41,11 +42,45 @@ class DocumentController extends Controller
 
     public function searchDocuments(Request $request)
     {
-        $searchTerm = $request->input('search');
-        $fileType = $request->input('file_type');
-        $perPage = $request->input('per_page', 10); // Default to 10 if not provided
+        if (!Auth::user()->hasGlobalPermission('can_view_documents')) {
+            return response()->json([
+                'error' => "You don't have permission"
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'workspace_id' => 'required|exists:workspaces,id',
+            'search' => 'nullable|string',
+            'file_type' => 'nullable|string',
+            'per_page' => 'nullable|integer|min:1|max:100',
+        ]);
+
+        $userId = Auth::id();
+        $workspaceId = $validated['workspace_id'];
+        $searchTerm = $validated['search'] ?? '';
+        $fileType = $validated['file_type'];
+        $perPage = $validated['per_page'] ?? 10;
+
+        // Check if user has access to the workspace
+        $canAccessWorkspace = Workspace::where('id', $workspaceId)
+            ->where(function ($query) use ($userId) {
+                $query->where('user_id', $userId)
+                    ->orWhereHas('users', function ($q) use ($userId) {
+                        $q->where('user_id', $userId);
+                    });
+            })
+            ->exists();
+
+        if (!$canAccessWorkspace) {
+            return response()->json([
+                'error' => "You don't have permission to access this workspace"
+            ], 403);
+        }
 
         $query = Document::with(['binder.cupboard'])
+            ->whereHas('binder.cupboard', function ($q) use ($workspaceId) {
+                $q->where('workspace_id', $workspaceId);
+            })
             ->where('title', 'like', '%' . $searchTerm . '%');
 
         if ($fileType) {
@@ -69,8 +104,6 @@ class DocumentController extends Controller
         if ($paginated->isEmpty()) {
             return response()->json([]);
         }
-
-        $userId = auth()->id();
 
         $result = $paginated->getCollection()->map(function ($document) use ($userId) {
             $fileSize = Storage::exists($document->path) ? Storage::size($document->path) : 0;

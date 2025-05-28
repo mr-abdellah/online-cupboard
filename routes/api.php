@@ -7,6 +7,8 @@ use App\Http\Controllers\CupboardUserPermissionController;
 use App\Http\Controllers\DocumentController;
 use App\Http\Controllers\DocumentUserPermissionController;
 use App\Http\Controllers\UserController;
+use App\Http\Controllers\WorkspaceController;
+use App\Http\Controllers\WorkspaceUserPermissionController;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Http\Request;
 
@@ -98,4 +100,17 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // serve files
     Route::get('/storage/converted/{filename}', [DocumentController::class, 'serveConvertedFile']);
+
+    // Workspace APIs
+    Route::get('/workspaces/manageable', [WorkspaceController::class, 'getManageable']);
+    Route::post('/workspaces', [WorkspaceController::class, 'store']);
+    Route::get('/workspaces/{workspace}', [WorkspaceController::class, 'show']);
+    Route::post('/workspaces/{workspace}', [WorkspaceController::class, 'update']);
+    Route::delete('/workspaces/{workspace}', [WorkspaceController::class, 'destroy']);
+    Route::post('/workspaces/{workspace}/share', [WorkspaceController::class, 'shareWithUser']);
+    Route::post('/workspaces/{workspace}/remove-user', [WorkspaceController::class, 'removeUserPermission']);
+
+    // workspace permissions
+    Route::post('/workspaces/{workspace}/permissions', [WorkspaceUserPermissionController::class, 'storeOrUpdate']);
+    Route::get('/workspaces/{workspace}/permissions', [WorkspaceUserPermissionController::class, 'getWorkspaceWithUsersAndPermissions']);
 });

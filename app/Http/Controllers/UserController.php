@@ -11,7 +11,10 @@ class UserController extends Controller
 {
     public function getAll(Request $request)
     {
-        $query = User::select('id', 'name', 'email', 'avatar');
+        $authUserId = auth()->id();
+
+        $query = User::select('id', 'name', 'email', 'avatar')
+            ->where('id', '!=', $authUserId);
 
         if ($request->has('query')) {
             $search = $request->input('query');
@@ -259,6 +262,4 @@ class UserController extends Controller
 
         return response()->json(['message' => 'User deleted']);
     }
-
-
 }

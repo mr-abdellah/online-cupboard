@@ -4,26 +4,51 @@ namespace App\Http\Controllers;
 
 use App\Models\Cupboard;
 use App\Models\CupboardUserPermission;
+use App\Models\Workspace;
+use App\Models\WorkspaceUserPermission;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
 
 class CupboardController extends Controller
 {
-
-    public function getAll()
+    public function getAll(Request $request)
     {
-        if (!auth()->user()->hasGlobalPermission('can_view_documents')) {
+        if (!Auth::user()->hasGlobalPermission('can_view_documents')) {
             return response()->json([
                 'error' => "You don't have permission"
             ], 403);
         }
 
-        $userId = auth()->id();
+        $validated = $request->validate([
+            'workspace_id' => 'required|exists:workspaces,id',
+        ]);
+
+        $userId = Auth::id();
+        $workspaceId = $validated['workspace_id'];
+
+        $canAccessWorkspace = Workspace::where('id', $workspaceId)
+            ->where(function ($query) use ($userId) {
+                $query->where('user_id', $userId)
+                    ->orWhereHas('users', function ($q) use ($userId) {
+                        $q->where('user_id', $userId);
+                    });
+            })
+            ->exists();
+
+        if (!$canAccessWorkspace) {
+            return response()->json([
+                'error' => "You don't have permission to access this workspace"
+            ], 403);
+        }
+
         $manageableCupboardIds = CupboardUserPermission::where('user_id', $userId)
             ->where('permission', 'manage')
             ->pluck('cupboard_id')
             ->toArray();
 
-        $cupboards = Cupboard::whereIn('id', $manageableCupboardIds)
+        $cupboards = Cupboard::where('workspace_id', $workspaceId)
+            ->whereIn('id', $manageableCupboardIds)
             ->orderBy('order')
             ->with([
                 'binders' => function ($binderQuery) {
@@ -32,14 +57,21 @@ class CupboardController extends Controller
                 }
             ])
             ->get()
-            ->map(function ($cupboard) {
+            ->map(function ($cupboard) use ($userId) {
+                $permissions = CupboardUserPermission::where('cupboard_id', $cupboard->id)
+                    ->where('user_id', $userId)
+                    ->pluck('permission')
+                    ->toArray();
+
                 return [
                     'id' => $cupboard->id,
                     'name' => $cupboard->name,
+                    'workspace_id' => $cupboard->workspace_id,
                     'order' => $cupboard->order,
                     'created_at' => $cupboard->created_at,
                     'updated_at' => $cupboard->updated_at,
-                    'can_manage' => true, // All returned cupboards are manageable
+                    'permissions' => $permissions,
+                    'can_manage' => in_array('manage', $permissions),
                     'binders' => $cupboard->binders->map(function ($binder) {
                         return [
                             'id' => $binder->id,
@@ -56,23 +88,45 @@ class CupboardController extends Controller
 
     public function index(Request $request)
     {
-        if (!auth()->user()->hasGlobalPermission('can_view_documents')) {
+        if (!Auth::user()->hasGlobalPermission('can_view_documents')) {
             return response()->json([
                 'error' => "You don't have permission"
             ], 403);
         }
 
-        $userId = auth()->id();
-        $searchQuery = $request->input('query');
-        $typeFilter = $request->input('type');
+        $validated = $request->validate([
+            'workspace_id' => 'required|exists:workspaces,id',
+            'query' => 'nullable|string',
+            'type' => 'nullable|string',
+        ]);
 
-        // Fetch cupboard IDs where the user has 'manage' permission
+        $userId = Auth::id();
+        $workspaceId = $validated['workspace_id'];
+        $searchQuery = $validated['query'] ?? '';
+        $typeFilter = $validated['type'] ?? '';
+
+        $canAccessWorkspace = Workspace::where('id', $workspaceId)
+            ->where(function ($query) use ($userId) {
+                $query->where('user_id', $userId)
+                    ->orWhereHas('users', function ($q) use ($userId) {
+                        $q->where('user_id', $userId);
+                    });
+            })
+            ->exists();
+
+        if (!$canAccessWorkspace) {
+            return response()->json([
+                'error' => "You don't have permission to access this workspace"
+            ], 403);
+        }
+
         $manageableCupboardIds = CupboardUserPermission::where('user_id', $userId)
             ->where('permission', 'manage')
             ->pluck('cupboard_id')
             ->toArray();
 
-        $query = Cupboard::query()->orderBy('order');
+        $query = Cupboard::where('workspace_id', $workspaceId)
+            ->orderBy('order');
 
         if ($searchQuery || $typeFilter) {
             $query->where(function ($q) use ($searchQuery, $typeFilter) {
@@ -151,10 +205,10 @@ class CupboardController extends Controller
             }
         ])->get();
 
-        $cupboards = $cupboards->map(function ($cupboard) use ($searchQuery, $typeFilter, $manageableCupboardIds) {
+        $cupboards = $cupboards->map(function ($cupboard) use ($searchQuery, $typeFilter, $manageableCupboardIds, $userId) {
             $cupboard->binders = $cupboard->binders->filter(function ($binder) use ($searchQuery, $typeFilter) {
                 if (!$searchQuery && !$typeFilter) {
-                    return true; // Include all binders when no search/filter
+                    return true;
                 }
                 $nameMatches = $searchQuery && stripos($binder->name, $searchQuery) !== false;
                 $hasMatchingDocuments = $binder->relationLoaded('documents') && $binder->documents->isNotEmpty();
@@ -164,10 +218,22 @@ class CupboardController extends Controller
                 return $binder;
             })->values();
 
-            // Add can_manage boolean
-            $cupboard->can_manage = in_array($cupboard->id, $manageableCupboardIds);
+            $permissions = CupboardUserPermission::where('cupboard_id', $cupboard->id)
+                ->where('user_id', $userId)
+                ->pluck('permission')
+                ->toArray();
 
-            return $cupboard;
+            return [
+                'id' => $cupboard->id,
+                'name' => $cupboard->name,
+                'workspace_id' => $cupboard->workspace_id,
+                'order' => $cupboard->order,
+                'created_at' => $cupboard->created_at,
+                'updated_at' => $cupboard->updated_at,
+                'permissions' => $permissions,
+                'can_manage' => in_array('manage', $permissions),
+                'binders' => $cupboard->binders,
+            ];
         });
 
         if ($searchQuery || $typeFilter) {
@@ -182,7 +248,7 @@ class CupboardController extends Controller
 
     public function store(Request $request)
     {
-        if (!auth()->user()->hasGlobalPermission('can_upload_documents')) {
+        if (!Auth::user()->hasGlobalPermission('can_upload_documents')) {
             return response()->json([
                 'error' => "You don't have permission"
             ], 403);
@@ -190,53 +256,176 @@ class CupboardController extends Controller
 
         $validated = $request->validate([
             'name' => 'required|string|max:255',
+            'workspace_id' => 'required|exists:workspaces,id',
+            'order' => 'nullable|integer',
+        ]);
+
+        $userId = Auth::id();
+        $workspace = Workspace::findOrFail($validated['workspace_id']);
+        $canAccessWorkspace = $workspace->user_id === $userId ||
+            WorkspaceUserPermission::where('workspace_id', $workspace->id)
+            ->where('user_id', $userId)
+            ->exists();
+
+        if (!$canAccessWorkspace) {
+            return response()->json([
+                'error' => "You don't have permission to create cupboards in this workspace"
+            ], 403);
+        }
+
+        $order = $validated['order'] ?? (Cupboard::where('workspace_id', $validated['workspace_id'])->max('order') + 1);
+
+        Log::info('Creating cupboard', [
+            'user_id' => $userId,
+            'workspace_id' => $validated['workspace_id'],
+            'order' => $order,
         ]);
 
         $cupboard = Cupboard::create([
             'name' => $validated['name'],
-            'order' => $validated['order'] ?? Cupboard::max('order') + 1,
+            'workspace_id' => $validated['workspace_id'],
+            'order' => $order,
         ]);
 
-        // Assign 'manage' permission to the authenticated user
-        $cupboard->users()->attach(auth()->id(), ['permission' => 'manage', 'created_at' => now(), 'updated_at' => now()]);
+        $permissionData = collect(['manage'])->map(function ($permission) use ($cupboard, $userId) {
+            return [
+                'cupboard_id' => $cupboard->id,
+                'user_id' => $userId,
+                'permission' => $permission,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+        })->toArray();
 
-        return response()->json($cupboard, 201);
+        CupboardUserPermission::insert($permissionData);
+
+        Log::info('Assigned cupboard permissions', [
+            'cupboard_id' => $cupboard->id,
+            'user_id' => $userId,
+            'permissions' => ['manage'],
+        ]);
+
+        return response()->json([
+            'id' => $cupboard->id,
+            'name' => $cupboard->name,
+            'workspace_id' => $cupboard->workspace_id,
+            'order' => $cupboard->order,
+            'created_at' => $cupboard->created_at,
+            'updated_at' => $cupboard->updated_at,
+            'permissions' => ['manage'],
+            'can_manage' => true,
+        ], 201);
     }
 
     public function show(Cupboard $cupboard)
     {
-        if (!auth()->user()->hasGlobalPermission('can_view_documents')) {
+        if (!Auth::user()->hasGlobalPermission('can_view_documents')) {
             return response()->json([
                 'error' => "You don't have permission"
             ], 403);
         }
-        return $cupboard->load('binders');
+
+        $userId = Auth::id();
+        $canView = $cupboard->workspace->user_id === $userId ||
+            WorkspaceUserPermission::where('workspace_id', $cupboard->workspace_id)
+            ->where('user_id', $userId)
+            ->exists() ||
+            CupboardUserPermission::where('cupboard_id', $cupboard->id)
+            ->where('user_id', $userId)
+            ->exists();
+
+        if (!$canView) {
+            return response()->json([
+                'error' => "You don't have permission to view this cupboard"
+            ], 403);
+        }
+
+        $cupboard->load(['binders' => function ($query) {
+            $query->select('id', 'name', 'cupboard_id', 'order')->orderBy('order');
+        }]);
+
+        $permissions = CupboardUserPermission::where('cupboard_id', $cupboard->id)
+            ->where('user_id', $userId)
+            ->pluck('permission')
+            ->toArray();
+
+        return response()->json([
+            'id' => $cupboard->id,
+            'name' => $cupboard->name,
+            'workspace_id' => $cupboard->workspace_id,
+            'order' => $cupboard->order,
+            'created_at' => $cupboard->created_at,
+            'updated_at' => $cupboard->updated_at,
+            'permissions' => $permissions,
+            'can_manage' => in_array('manage', $permissions),
+            'binders' => $cupboard->binders,
+        ]);
     }
 
     public function update(Request $request, Cupboard $cupboard)
     {
-        if (!auth()->user()->hasGlobalPermission('can_edit_documents')) {
+        if (!Auth::user()->hasGlobalPermission('can_edit_documents')) {
             return response()->json([
                 'error' => "You don't have permission"
             ], 403);
         }
-        $request->validate([
+
+        $userId = Auth::id();
+        $canEdit = CupboardUserPermission::where('cupboard_id', $cupboard->id)
+            ->where('user_id', $userId)
+            ->where('permission', 'manage')
+            ->exists();
+
+        if (!$canEdit) {
+            return response()->json([
+                'error' => "You don't have permission to edit this cupboard"
+            ], 403);
+        }
+
+        $validated = $request->validate([
             'name' => 'required|string|max:255',
             'order' => 'nullable|integer',
         ]);
 
-        $cupboard->update($request->only(['name', 'order']));
+        $cupboard->update($validated);
 
-        return response()->json($cupboard);
+        $permissions = CupboardUserPermission::where('cupboard_id', $cupboard->id)
+            ->where('user_id', $userId)
+            ->pluck('permission')
+            ->toArray();
+
+        return response()->json([
+            'id' => $cupboard->id,
+            'name' => $cupboard->name,
+            'workspace_id' => $cupboard->workspace_id,
+            'order' => $cupboard->order,
+            'created_at' => $cupboard->created_at,
+            'updated_at' => $cupboard->updated_at,
+            'permissions' => $permissions,
+            'can_manage' => in_array('manage', $permissions),
+        ]);
     }
 
     public function destroy(Cupboard $cupboard)
     {
-        if (!auth()->user()->hasGlobalPermission('can_delete_document')) {
+        if (!Auth::user()->hasGlobalPermission('can_delete_document')) {
             return response()->json([
                 'error' => "You don't have permission"
             ], 403);
         }
+
+        $userId = Auth::id();
+        $canDelete = CupboardUserPermission::where('cupboard_id', $cupboard->id)
+            ->where('user_id', $userId)
+            ->where('permission', 'manage')
+            ->exists();
+
+        if (!$canDelete) {
+            return response()->json([
+                'error' => "You don't have permission to delete this cupboard"
+            ], 403);
+        }
+
         $cupboard->delete();
         return response()->json(['message' => 'Deleted']);
     }
