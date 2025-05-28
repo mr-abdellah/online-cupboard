@@ -12,6 +12,94 @@ use Illuminate\Support\Facades\Log;
 
 class CupboardController extends Controller
 {
+    public function getWorkspaces(Request $request)
+    {
+        if (!Auth::user()->hasGlobalPermission('can_view_documents')) {
+            return response()->json(['error' => "You don't have permission"], 403);
+        }
+
+        $validated = $request->validate([
+            'query' => 'nullable|string',
+        ]);
+
+        $userId = Auth::id();
+        $searchQuery = $validated['query'] ?? '';
+
+        $query = Workspace::where(function ($query) use ($userId) {
+            $query->where('user_id', $userId)
+                ->orWhereHas('users', function ($q) use ($userId) {
+                    $q->where('user_id', $userId);
+                });
+        })->orderBy('order');
+
+        if ($searchQuery) {
+            $query->where(function ($q) use ($searchQuery) {
+                $q->where('name', 'like', "%{$searchQuery}%")
+                    ->orWhereHas('cupboards', function ($cupboardQuery) use ($searchQuery) {
+                        $cupboardQuery->where('name', 'like', "%{$searchQuery}%")
+                            ->orWhereHas('binders', function ($binderQuery) use ($searchQuery) {
+                                $binderQuery->where('name', 'like', "%{$searchQuery}%")
+                                    ->orWhereHas('documents', function ($documentQuery) use ($searchQuery) {
+                                        $documentQuery->where('is_searchable', true)
+                                            ->where(function ($dq) use ($searchQuery) {
+                                                $dq->where('title', 'like', "%{$searchQuery}%")
+                                                    ->orWhere('description', 'like', "%{$searchQuery}%")
+                                                    ->orWhereJsonContains('tags', $searchQuery);
+                                            });
+                                    });
+                            });
+                    });
+            });
+        }
+
+        $workspaces = $query->with([
+            'cupboards' => function ($cupboardQuery) use ($userId) {
+                $cupboardQuery->whereHas('users', function ($q) use ($userId) {
+                    $q->where('user_id', $userId)
+                        ->where('permission', 'manage');
+                })->orderBy('order');
+            }
+        ])->get();
+
+        $workspaces = $workspaces->map(function ($workspace) use ($userId) {
+            $workspace->cupboards = $workspace->cupboards->map(function ($cupboard) use ($userId) {
+                $permissions = CupboardUserPermission::where('cupboard_id', $cupboard->id)
+                    ->where('user_id', $userId)
+                    ->pluck('permission')
+                    ->toArray();
+
+                return [
+                    'id' => $cupboard->id,
+                    'name' => $cupboard->name,
+                    'workspace_id' => $cupboard->workspace_id,
+                    'order' => $cupboard->order,
+                    'created_at' => $cupboard->created_at,
+                    'updated_at' => $cupboard->updated_at,
+                    'permissions' => $permissions,
+                    'can_manage' => in_array('manage', $permissions),
+                ];
+            })->values();
+
+            $permissions = WorkspaceUserPermission::where('workspace_id', $workspace->id)
+                ->where('user_id', $userId)
+                ->pluck('permission')
+                ->toArray();
+
+            return [
+                'id' => $workspace->id,
+                'name' => $workspace->name,
+                'description' => $workspace->description,
+                'order' => $workspace->order,
+                'is_active' => $workspace->is_active,
+                'created_at' => $workspace->created_at,
+                'updated_at' => $workspace->updated_at,
+                'permissions' => $permissions,
+                'cupboards' => $workspace->cupboards,
+            ];
+        })->values();
+
+        return response()->json($workspaces);
+    }
     public function getAll(Request $request)
     {
         if (!Auth::user()->hasGlobalPermission('can_view_documents')) {
@@ -264,8 +352,8 @@ class CupboardController extends Controller
         $workspace = Workspace::findOrFail($validated['workspace_id']);
         $canAccessWorkspace = $workspace->user_id === $userId ||
             WorkspaceUserPermission::where('workspace_id', $workspace->id)
-            ->where('user_id', $userId)
-            ->exists();
+                ->where('user_id', $userId)
+                ->exists();
 
         if (!$canAccessWorkspace) {
             return response()->json([
@@ -328,11 +416,11 @@ class CupboardController extends Controller
         $userId = Auth::id();
         $canView = $cupboard->workspace->user_id === $userId ||
             WorkspaceUserPermission::where('workspace_id', $cupboard->workspace_id)
-            ->where('user_id', $userId)
-            ->exists() ||
+                ->where('user_id', $userId)
+                ->exists() ||
             CupboardUserPermission::where('cupboard_id', $cupboard->id)
-            ->where('user_id', $userId)
-            ->exists();
+                ->where('user_id', $userId)
+                ->exists();
 
         if (!$canView) {
             return response()->json([
@@ -340,9 +428,11 @@ class CupboardController extends Controller
             ], 403);
         }
 
-        $cupboard->load(['binders' => function ($query) {
-            $query->select('id', 'name', 'cupboard_id', 'order')->orderBy('order');
-        }]);
+        $cupboard->load([
+            'binders' => function ($query) {
+                $query->select('id', 'name', 'cupboard_id', 'order')->orderBy('order');
+            }
+        ]);
 
         $permissions = CupboardUserPermission::where('cupboard_id', $cupboard->id)
             ->where('user_id', $userId)

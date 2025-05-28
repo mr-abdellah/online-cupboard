@@ -72,6 +72,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/cupboards', [CupboardController::class, 'index']);
     Route::post('/cupboards', [CupboardController::class, 'store']);
     Route::get('/cupboards/all', [CupboardController::class, 'getAll']);
+    Route::get('/cupboards/workspaces', [CupboardController::class, 'getWorkspaces']);
     Route::get('/cupboards/{cupboard}', [CupboardController::class, 'show']);
     Route::post('/cupboards/{cupboard}', [CupboardController::class, 'update']);
     Route::delete('/cupboards/{cupboard}', [CupboardController::class, 'destroy']);
@@ -93,7 +94,12 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/documents/{document}', [DocumentController::class, 'show']);
     Route::post('/documents/{document}', [DocumentController::class, 'update']);
     Route::delete('/documents/{document}', [DocumentController::class, 'destroy']);
-    Route::get('/documents/{document}/download', [DocumentController::class, 'download']);
+    Route::get('/documents/{document}/download', [DocumentController::class, 'download'])
+        ->name('documents.download');
+
+    // New route for actual file serving
+    Route::get('/documents/{document}/file', [DocumentController::class, 'downloadFile'])
+        ->name('documents.download.file');
     Route::get('/documents/{document}/display', [DocumentController::class, 'display']);
     Route::put('/documents/{document}/change-binder', [DocumentController::class, 'changeBinder']);
     Route::post('/documents/{documentId}/copy-to-binders', [DocumentController::class, 'copyToBinders']);
