@@ -2,9 +2,13 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Cupboard;
+use App\Models\CupboardUserPermission;
 use App\Models\Document;
 use App\Models\DocumentUserPermission;
 use App\Models\User;
+use App\Models\Workspace;
+use App\Models\WorkspaceUserPermission;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -15,7 +19,6 @@ class DocumentUserPermissionController extends Controller
 {
     public function storeOrUpdate(Request $request, Document $document)
     {
-        // Validate the request input
         $validated = $request->validate([
             'users' => 'nullable|array',
             'users.*.user_id' => 'required|exists:users,id',
@@ -24,18 +27,15 @@ class DocumentUserPermissionController extends Controller
             'is_public' => 'nullable|boolean',
         ]);
 
-        // Log the entire request payload for debugging
         Log::info('storeOrUpdate request payload', [
             'document_id' => $document->id,
             'payload' => $request->all()
         ]);
 
-        // Check if is_public is provided in the request and update the document
         if (isset($validated['is_public'])) {
             $document->is_public = $validated['is_public'];
             $document->save();
 
-            // If is_public is true, clear permissions except for the owner
             if ($validated['is_public']) {
                 DocumentUserPermission::where('document_id', $document->id)
                     ->where('user_id', '!=', $document->user_id)
@@ -50,7 +50,6 @@ class DocumentUserPermissionController extends Controller
             }
         }
 
-        // If users data is not provided, return early
         if (!isset($validated['users'])) {
             Log::info('No users provided for permission updates', [
                 'document_id' => $document->id
@@ -62,15 +61,16 @@ class DocumentUserPermissionController extends Controller
         }
 
         $usersData = $validated['users'];
+        $binder = $document->binder;
+        $cupboard = $binder ? Cupboard::find($binder->cupboard_id) : null;
+        $workspace = $cupboard ? Workspace::find($cupboard->workspace_id) : null;
 
-        // Start a transaction to ensure consistency
         DB::beginTransaction();
         try {
             foreach ($usersData as $userData) {
                 $userId = $userData['user_id'];
                 $permissions = $userData['permissions'] ?? [];
 
-                // Log the input for debugging
                 Log::info('Processing permissions for user', [
                     'user_id' => $userId,
                     'document_id' => $document->id,
@@ -78,7 +78,43 @@ class DocumentUserPermissionController extends Controller
                     'is_owner' => $userId == $document->user_id
                 ]);
 
-                // Delete all existing permissions for this user (no owner protection)
+                if (in_array('view', $permissions) && $cupboard && $workspace) {
+                    $hasCupboardPermission = CupboardUserPermission::where('user_id', $userId)
+                        ->where('cupboard_id', $cupboard->id)
+                        ->exists();
+                    $hasWorkspacePermission = WorkspaceUserPermission::where('user_id', $userId)
+                        ->where('workspace_id', $workspace->id)
+                        ->exists();
+
+                    if (!$hasCupboardPermission) {
+                        CupboardUserPermission::create([
+                            'cupboard_id' => $cupboard->id,
+                            'user_id' => $userId,
+                            'permission' => 'manage',
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ]);
+                        Log::info('Added manage permission to cupboard', [
+                            'user_id' => $userId,
+                            'cupboard_id' => $cupboard->id
+                        ]);
+                    }
+
+                    if (!$hasWorkspacePermission) {
+                        WorkspaceUserPermission::create([
+                            'workspace_id' => $workspace->id,
+                            'user_id' => $userId,
+                            'permission' => 'view',
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ]);
+                        Log::info('Added view permission to workspace', [
+                            'user_id' => $userId,
+                            'workspace_id' => $workspace->id
+                        ]);
+                    }
+                }
+
                 DocumentUserPermission::where('document_id', $document->id)
                     ->where('user_id', $userId)
                     ->delete();
@@ -87,7 +123,6 @@ class DocumentUserPermissionController extends Controller
                     'document_id' => $document->id
                 ]);
 
-                // If no permissions provided, skip to next user
                 if (empty($permissions)) {
                     Log::info('No permissions provided; skipping insert', [
                         'user_id' => $userId,
@@ -96,7 +131,6 @@ class DocumentUserPermissionController extends Controller
                     continue;
                 }
 
-                // Prepare new permissions for insertion
                 $updates = [];
                 foreach ($permissions as $permission) {
                     $updates[] = [
@@ -108,7 +142,6 @@ class DocumentUserPermissionController extends Controller
                     ];
                 }
 
-                // Insert new permissions
                 if (!empty($updates)) {
                     DocumentUserPermission::insert($updates);
                     Log::info('Inserted new permissions', [
@@ -119,10 +152,8 @@ class DocumentUserPermissionController extends Controller
                 }
             }
 
-            // Commit the transaction
             DB::commit();
 
-            // Fetch updated permissions for all affected users
             $updatedPermissions = DocumentUserPermission::where('document_id', $document->id)
                 ->whereIn('user_id', array_column($usersData, 'user_id'))
                 ->get()

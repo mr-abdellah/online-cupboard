@@ -5,7 +5,10 @@ namespace App\Http\Controllers;
 use App\Models\Cupboard;
 use App\Models\CupboardUserPermission;
 use App\Models\User;
+use App\Models\Workspace;
+use App\Models\WorkspaceUserPermission;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\URL;
 
@@ -86,18 +89,15 @@ class CupboardUserPermissionController extends Controller
         $user = User::findOrFail($userId);
         $submittedCupboardIds = $validated['cupboard_ids'];
 
-        // Get all current cupboard permissions for the user
         $existingPermissions = CupboardUserPermission::where('user_id', $userId)->pluck('cupboard_id')->toArray();
         $cupboardsToRemove = array_diff($existingPermissions, $submittedCupboardIds);
 
-        // Delete permissions for cupboards no longer included
         if (!empty($cupboardsToRemove)) {
             CupboardUserPermission::where('user_id', $userId)
                 ->whereIn('cupboard_id', $cupboardsToRemove)
                 ->delete();
         }
 
-        // Prepare and insert new permissions
         $updates = [];
         $newCupboardIds = array_diff($submittedCupboardIds, $existingPermissions);
         foreach ($newCupboardIds as $cupboardId) {
@@ -108,6 +108,27 @@ class CupboardUserPermissionController extends Controller
                 'created_at' => now(),
                 'updated_at' => now(),
             ];
+
+            $cupboard = Cupboard::find($cupboardId);
+            if ($cupboard && $cupboard->workspace_id) {
+                $hasWorkspacePermission = WorkspaceUserPermission::where('user_id', $userId)
+                    ->where('workspace_id', $cupboard->workspace_id)
+                    ->exists();
+
+                if (!$hasWorkspacePermission) {
+                    WorkspaceUserPermission::create([
+                        'workspace_id' => $cupboard->workspace_id,
+                        'user_id' => $userId,
+                        'permission' => 'view',
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ]);
+                    Log::info('Added view permission to workspace', [
+                        'user_id' => $userId,
+                        'workspace_id' => $cupboard->workspace_id
+                    ]);
+                }
+            }
         }
 
         if (!empty($updates)) {
@@ -128,23 +149,20 @@ class CupboardUserPermissionController extends Controller
 
         $cupboard = Cupboard::findOrFail($cupboardId);
         $submittedUserIds = $validated['user_ids'];
+        $workspace = Workspace::find($cupboard->workspace_id);
 
-        // Get all current users with permissions for this cupboard
         $existingPermissions = CupboardUserPermission::where('cupboard_id', $cupboardId)
             ->pluck('user_id')
             ->toArray();
 
-        // Identify users to remove (those in existing but not in submitted)
         $usersToRemove = array_diff($existingPermissions, $submittedUserIds);
 
-        // Delete permissions for users no longer included
         if (!empty($usersToRemove)) {
             CupboardUserPermission::where('cupboard_id', $cupboardId)
                 ->whereIn('user_id', $usersToRemove)
                 ->delete();
         }
 
-        // Prepare and insert new permissions for users not already assigned
         $updates = [];
         $newUserIds = array_diff($submittedUserIds, $existingPermissions);
         foreach ($newUserIds as $userId) {
@@ -155,6 +173,26 @@ class CupboardUserPermissionController extends Controller
                 'created_at' => now(),
                 'updated_at' => now(),
             ];
+
+            if ($workspace) {
+                $hasWorkspacePermission = WorkspaceUserPermission::where('user_id', $userId)
+                    ->where('workspace_id', $workspace->id)
+                    ->exists();
+
+                if (!$hasWorkspacePermission) {
+                    WorkspaceUserPermission::create([
+                        'workspace_id' => $workspace->id,
+                        'user_id' => $userId,
+                        'permission' => 'view',
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ]);
+                    Log::info('Added view permission to workspace', [
+                        'user_id' => $userId,
+                        'workspace_id' => $workspace->id
+                    ]);
+                }
+            }
         }
 
         if (!empty($updates)) {

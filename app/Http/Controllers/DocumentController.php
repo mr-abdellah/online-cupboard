@@ -7,19 +7,17 @@ use App\Models\CupboardUserPermission;
 use App\Models\Document;
 use App\Models\DocumentUserPermission;
 use App\Models\Workspace;
+use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
 use Spatie\PdfToImage\Pdf;
 use thiagoalessio\TesseractOCR\TesseractOCR;
 use PhpOffice\PhpWord\IOFactory as PhpWordIOFactory;
 use PhpOffice\PhpSpreadsheet\IOFactory as SpreadsheetIOFactory;
 use PhpOffice\PhpPresentation\IOFactory as PresentationIOFactory;
-use Symfony\Component\Mime\MimeTypes;
-use NcJoes\OfficeConverter\OfficeConverter;
-use Illuminate\Http\Response;
+use Illuminate\Support\Facades\Storage;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 class DocumentController extends Controller
@@ -454,60 +452,16 @@ class DocumentController extends Controller
         return auth()->user()->hasDocumentPermission($document, 'view');
     }
 
-    private function detectMimeType(string $filePath): string
-    {
-        $mimeTypes = new MimeTypes();
-        $mimeType = $mimeTypes->guessMimeType($filePath);
-
-        if (!$mimeType) {
-            $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-            $extensionMap = [
-                'doc' => 'application/msword',
-                'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                'xls' => 'application/vnd.ms-excel',
-                'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                'ppt' => 'application/vnd.ms-powerpoint',
-                'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-                'pdf' => 'application/pdf',
-                'jpg' => 'image/jpeg',
-                'jpeg' => 'image/jpeg',
-                'png' => 'image/png',
-                'gif' => 'image/gif',
-            ];
-
-            $mimeType = $extensionMap[$extension] ?? 'application/octet-stream';
-        }
-
-        return $mimeType;
-    }
-
-    public function cleanPdfCache(): void
-    {
-        $cacheDir = storage_path('app/pdf_cache');
-        if (!is_dir($cacheDir)) {
-            return;
-        }
-
-        $files = glob("$cacheDir/*.pdf");
-        $maxAge = 7 * 24 * 3600; // 7 days
-
-        foreach ($files as $file) {
-            if (filemtime($file) < time() - $maxAge) {
-                unlink($file);
-            }
-        }
-    }
-
     public function display(Document $document)
     {
         // Security check
         if (!$this->canViewDocument($document)) {
-            return response()->json(['error' => 'Unauthorized'], 403);
+            abort(403, 'Unauthorized');
         }
 
         // Check if file exists
         if (!Storage::disk('local')->exists($document->path)) {
-            return response()->json(['error' => 'File not found'], 404);
+            abort(404, 'File not found');
         }
 
         $fullPath = Storage::disk('local')->path($document->path);
@@ -516,115 +470,681 @@ class DocumentController extends Controller
         Log::info("Document display request", [
             'document_id' => $document->id,
             'mime_type' => $mimeType,
-            'path' => $document->path
+            'file_size' => filesize($fullPath),
+            'file_path' => $fullPath
         ]);
 
-        // Handle convertible documents
+        // If it's already PDF, serve it directly
+        if ($mimeType === 'application/pdf') {
+            return $this->servePdf($fullPath, $document->title);
+        }
+
+        // Convert to PDF if possible
         if (in_array($mimeType, self::CONVERTIBLE_TYPES)) {
-            return $this->handleConvertibleDocument($document, $mimeType);
+            $pdfPath = $this->convertToPdf($document, $mimeType);
+
+            if ($pdfPath && file_exists($pdfPath)) {
+                return $this->servePdf($pdfPath, $document->title);
+            }
         }
 
-        // Handle directly viewable documents
-        if (in_array($mimeType, self::VIEWABLE_TYPES)) {
-            return $this->serveFile($fullPath, $mimeType, $document->title);
-        }
-
-        return response()->json(['error' => 'Unsupported file type for preview'], 415);
+        // If we can't convert, show error
+        abort(415, 'Cannot display this file type. Supported: DOC, DOCX, XLS, XLSX, PPT, PPTX, PDF, TXT');
     }
 
-    private function handleConvertibleDocument(Document $document, string $mimeType): BinaryFileResponse
+    /**
+     * Convert document to PDF with multiple fallback methods
+     */
+    private function convertToPdf(Document $document, string $mimeType): ?string
     {
-        $fullPath = Storage::disk('local')->path($document->path);
+        $inputPath = Storage::disk('local')->path($document->path);
+        $cacheKey = md5($document->path . $document->updated_at . filemtime($inputPath));
         $cacheDir = storage_path('app/pdf_cache');
-        $cacheFileName = md5($document->path . $document->updated_at) . '.pdf';
-        $cachePath = "$cacheDir/$cacheFileName";
+        $cachedPdf = "$cacheDir/{$cacheKey}.pdf";
 
-        // Check if cached PDF exists and is valid
-        if (file_exists($cachePath) && filemtime($cachePath) >= filemtime($fullPath)) {
-            return $this->serveFile($cachePath, 'application/pdf', $document->title);
+        // Return cached PDF if it exists and is valid
+        if (file_exists($cachedPdf) && filesize($cachedPdf) > 1000) {
+            Log::info("Using cached PDF", ['document_id' => $document->id]);
+            return $cachedPdf;
         }
 
-        // Ensure cache directory exists
+        // Create cache directory
         if (!is_dir($cacheDir)) {
             mkdir($cacheDir, 0755, true);
         }
 
-        try {
-            // Convert document to PDF
-            $converter = new OfficeConverter($fullPath, $cacheDir);
-            $converter->convertTo($cacheFileName);
+        $tempDir = storage_path('app/temp/' . uniqid());
+        mkdir($tempDir, 0755, true);
 
-            if (file_exists($cachePath)) {
-                return $this->serveFile($cachePath, 'application/pdf', $document->title);
+        Log::info("Created temp directory", [
+            'document_id' => $document->id,
+            'temp_dir' => $tempDir,
+            'cache_dir' => $cacheDir
+        ]);
+
+        try {
+            // Try conversion methods in order
+            $methods = $this->getConversionMethods($mimeType);
+
+            foreach ($methods as $method) {
+                Log::info("Trying conversion method", [
+                    'document_id' => $document->id,
+                    'method' => $method
+                ]);
+
+                $result = $this->$method($inputPath, $tempDir, $cachedPdf);
+
+                Log::info("Conversion method result", [
+                    'document_id' => $document->id,
+                    'method' => $method,
+                    'result' => $result,
+                    'output_exists' => file_exists($cachedPdf),
+                    'output_size' => file_exists($cachedPdf) ? filesize($cachedPdf) : 0
+                ]);
+
+                if ($result && file_exists($cachedPdf) && filesize($cachedPdf) > 1000) {
+                    Log::info("Conversion successful", [
+                        'document_id' => $document->id,
+                        'method' => $method,
+                        'size' => filesize($cachedPdf)
+                    ]);
+                    return $cachedPdf;
+                }
+
+                // Clean up failed attempt
+                if (file_exists($cachedPdf)) {
+                    unlink($cachedPdf);
+                }
             }
 
-            return response()->json(['error' => 'Conversion failed'], 500);
-        } catch (\Exception $e) {
-            Log::error("Document conversion failed", [
+            Log::error("All conversion methods failed", [
                 'document_id' => $document->id,
-                'error' => $e->getMessage()
+                'mime_type' => $mimeType
             ]);
-            return response()->json(['error' => 'Conversion error'], 500);
+
+            return null;
+        } finally {
+            $this->removeDirectory($tempDir);
         }
     }
 
-    private function serveFile(string $filePath, string $mimeType, string $title): BinaryFileResponse
+    /**
+     * Get conversion methods based on file type
+     */
+    private function getConversionMethods(string $mimeType): array
     {
-        return response()->file($filePath, [
-            'Content-Type' => $mimeType,
-            'Content-Disposition' => 'inline; filename="' . $title . '"'
+        // For text files, use text-specific method first
+        if ($this->isTextFile($mimeType)) {
+            return ['convertTextToPdf', 'convertWithLibreOffice'];
+        }
+
+        // For Excel, use Excel-specific methods
+        if ($this->isExcelFile($mimeType)) {
+            return ['convertExcelToPdf', 'convertWithLibreOffice'];
+        }
+
+        // For everything else, standard LibreOffice
+        return ['convertWithLibreOffice', 'convertWithUnoconv'];
+    }
+
+    /**
+     * Convert text files to PDF
+     */
+    private function convertTextToPdf(string $inputPath, string $tempDir, string $outputPath): bool
+    {
+        $content = file_get_contents($inputPath);
+        if ($content === false) {
+            Log::error("Failed to read text file", ['path' => $inputPath]);
+            return false;
+        }
+
+        // Create HTML version
+        $html = $this->textToHtml($content, basename($inputPath));
+        $htmlFile = "$tempDir/document.html";
+        file_put_contents($htmlFile, $html);
+
+        // Try wkhtmltopdf first
+        if ($this->htmlToPdfWithWkhtml($htmlFile, $outputPath)) {
+            return true;
+        }
+
+        // Fallback to LibreOffice
+        return $this->convertWithLibreOffice($htmlFile, $tempDir, $outputPath);
+    }
+
+    /**
+     * Convert text to HTML
+     */
+    private function textToHtml(string $content, string $filename): string
+    {
+        $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+
+        if ($extension === 'csv') {
+            return $this->csvToHtml($content, $filename);
+        }
+
+        // For plain text
+        $htmlContent = '<pre style="font-family: Consolas, monospace; white-space: pre-wrap; word-wrap: break-word; font-size: 12px; line-height: 1.4;">';
+        $htmlContent .= htmlspecialchars($content);
+        $htmlContent .= '</pre>';
+
+        return "<!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset=\"UTF-8\">
+        <title>" . htmlspecialchars($filename) . "</title>
+        <style>
+            body { margin: 20px; font-family: Arial, sans-serif; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { border: 1px solid #ccc; padding: 8px; text-align: left; font-size: 11px; }
+            th { background-color: #f0f0f0; }
+        </style>
+    </head>
+    <body>
+        <h2>" . htmlspecialchars($filename) . "</h2>
+        $htmlContent
+    </body>
+    </html>";
+    }
+
+    /**
+     * Convert CSV to HTML table
+     */
+    private function csvToHtml(string $content, string $filename): string
+    {
+        $lines = explode("\n", trim($content));
+        $table = '<table>';
+
+        foreach ($lines as $index => $line) {
+            if (empty(trim($line))) continue;
+
+            $cells = str_getcsv($line);
+            $table .= '<tr>';
+
+            foreach ($cells as $cell) {
+                $tag = $index === 0 ? 'th' : 'td';
+                $table .= "<$tag>" . htmlspecialchars(trim($cell)) . "</$tag>";
+            }
+
+            $table .= '</tr>';
+        }
+
+        $table .= '</table>';
+
+        return $this->textToHtml($table, $filename);
+    }
+
+    /**
+     * HTML to PDF using wkhtmltopdf
+     */
+    private function htmlToPdfWithWkhtml(string $htmlFile, string $outputPath): bool
+    {
+        $wkhtml = $this->findExecutable('wkhtmltopdf');
+        if (!$wkhtml) {
+            Log::info("wkhtmltopdf not found");
+            return false;
+        }
+
+        // Windows-compatible command
+        $command = sprintf(
+            '"%s" --page-size A4 --margin-top 15mm --margin-bottom 15mm --margin-left 15mm --margin-right 15mm --quiet "%s" "%s" 2>nul',
+            $wkhtml,
+            $htmlFile,
+            $outputPath
+        );
+
+        Log::info("Executing wkhtmltopdf command", ['command' => $command]);
+        exec($command, $output, $exitCode);
+
+        Log::info("wkhtmltopdf result", [
+            'exit_code' => $exitCode,
+            'output_exists' => file_exists($outputPath),
+            'output_size' => file_exists($outputPath) ? filesize($outputPath) : 0
         ]);
+
+        return $exitCode === 0 && file_exists($outputPath);
+    }
+
+    /**
+     * Excel-specific conversion
+     */
+    private function convertExcelToPdf(string $inputPath, string $tempDir, string $outputPath): bool
+    {
+        $soffice = $this->findLibreOffice();
+        if (!$soffice) {
+            Log::error("LibreOffice not found for Excel conversion");
+            return false;
+        }
+
+        Log::info("Found LibreOffice", ['path' => $soffice]);
+
+        $userProfile = "$tempDir\\soffice_profile";
+        mkdir($userProfile, 0755, true);
+
+        // Check if input file is readable
+        if (!is_readable($inputPath)) {
+            Log::error("Input file not readable", ['path' => $inputPath]);
+            return false;
+        }
+
+        // Windows-compatible command
+        $command = sprintf(
+            'set HOME=%s && "%s" --headless --invisible --nodefault --nofirststartwizard --calc --convert-to pdf --outdir "%s" "%s" 2>nul',
+            escapeshellarg($userProfile),
+            $soffice,
+            $tempDir,
+            $inputPath
+        );
+
+        Log::info("Executing Excel conversion command", ['command' => $command]);
+        exec($command, $output, $exitCode);
+
+        Log::info("Excel conversion result", [
+            'exit_code' => $exitCode,
+            'output' => implode("\n", $output),
+            'temp_dir_contents' => scandir($tempDir)
+        ]);
+
+        // Find the generated PDF
+        $files = glob("$tempDir\\*.pdf");
+        if (empty($files)) {
+            $files = glob("$tempDir/*.pdf"); // Try forward slash too
+        }
+
+        Log::info("PDF files found", ['files' => $files]);
+
+        if (!empty($files)) {
+            $generatedPdf = reset($files);
+            if (file_exists($generatedPdf) && filesize($generatedPdf) > 1000) {
+                Log::info("Moving generated PDF", [
+                    'from' => $generatedPdf,
+                    'to' => $outputPath,
+                    'size' => filesize($generatedPdf)
+                ]);
+                return rename($generatedPdf, $outputPath);
+            } else {
+                Log::error("Generated PDF too small or doesn't exist", [
+                    'file' => $generatedPdf,
+                    'exists' => file_exists($generatedPdf),
+                    'size' => file_exists($generatedPdf) ? filesize($generatedPdf) : 0
+                ]);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Standard LibreOffice conversion
+     */
+    private function convertWithLibreOffice(string $inputPath, string $tempDir, string $outputPath): bool
+    {
+        $soffice = $this->findLibreOffice();
+        if (!$soffice) {
+            Log::error("LibreOffice not found");
+            return false;
+        }
+
+        Log::info("Found LibreOffice", ['path' => $soffice]);
+
+        $userProfile = "$tempDir\\soffice_profile";
+        if (!is_dir($userProfile)) {
+            mkdir($userProfile, 0755, true);
+        }
+
+        // Check if input file is readable
+        if (!is_readable($inputPath)) {
+            Log::error("Input file not readable", ['path' => $inputPath]);
+            return false;
+        }
+
+        // Windows-compatible command
+        $command = sprintf(
+            'set HOME=%s && "%s" --headless --invisible --nodefault --nofirststartwizard --convert-to pdf --outdir "%s" "%s" 2>nul',
+            escapeshellarg($userProfile),
+            $soffice,
+            $tempDir,
+            $inputPath
+        );
+
+        Log::info("Executing LibreOffice command", ['command' => $command]);
+        exec($command, $output, $exitCode);
+
+        Log::info("LibreOffice conversion result", [
+            'exit_code' => $exitCode,
+            'output' => implode("\n", $output),
+            'temp_dir_contents' => scandir($tempDir)
+        ]);
+
+        // Find the generated PDF - try both slash types
+        $files = glob("$tempDir\\*.pdf");
+        if (empty($files)) {
+            $files = glob("$tempDir/*.pdf");
+        }
+
+        Log::info("PDF files found", ['files' => $files]);
+
+        if (!empty($files)) {
+            $generatedPdf = reset($files);
+            if (file_exists($generatedPdf) && filesize($generatedPdf) > 1000) {
+                Log::info("Moving generated PDF", [
+                    'from' => $generatedPdf,
+                    'to' => $outputPath,
+                    'size' => filesize($generatedPdf)
+                ]);
+                return rename($generatedPdf, $outputPath);
+            } else {
+                Log::error("Generated PDF too small or doesn't exist", [
+                    'file' => $generatedPdf,
+                    'exists' => file_exists($generatedPdf),
+                    'size' => file_exists($generatedPdf) ? filesize($generatedPdf) : 0
+                ]);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Unoconv conversion (alternative to LibreOffice)
+     */
+    private function convertWithUnoconv(string $inputPath, string $tempDir, string $outputPath): bool
+    {
+        $unoconv = $this->findExecutable('unoconv');
+        if (!$unoconv) {
+            Log::info("unoconv not found");
+            return false;
+        }
+
+        // Windows-compatible command
+        $command = sprintf(
+            '"%s" -f pdf -o "%s" "%s" 2>nul',
+            $unoconv,
+            $outputPath,
+            $inputPath
+        );
+
+        Log::info("Executing unoconv command", ['command' => $command]);
+        exec($command, $output, $exitCode);
+
+        Log::info("unoconv result", [
+            'exit_code' => $exitCode,
+            'output' => implode("\n", $output),
+            'output_exists' => file_exists($outputPath),
+            'output_size' => file_exists($outputPath) ? filesize($outputPath) : 0
+        ]);
+
+        return $exitCode === 0 && file_exists($outputPath) && filesize($outputPath) > 1000;
+    }
+
+    /**
+     * Find LibreOffice executable on Windows
+     */
+    private function findLibreOffice(): ?string
+    {
+        // Windows paths for LibreOffice
+        $paths = [
+            'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
+            'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe',
+            'C:\\LibreOffice\\program\\soffice.exe',
+            'C:\\Program Files\\LibreOffice\\program\\soffice.com',
+            'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.com',
+        ];
+
+        foreach ($paths as $path) {
+            if (file_exists($path) && is_executable($path)) {
+                Log::info("Found LibreOffice at", ['path' => $path]);
+                return $path;
+            }
+        }
+
+        // Try where command (Windows equivalent of which)
+        exec('where soffice 2>nul', $output, $exitCode);
+        if ($exitCode === 0 && !empty($output)) {
+            $path = trim($output[0]);
+            Log::info("Found soffice via where", ['path' => $path]);
+            return $path;
+        }
+
+        exec('where libreoffice 2>nul', $output, $exitCode);
+        if ($exitCode === 0 && !empty($output)) {
+            $path = trim($output[0]);
+            Log::info("Found libreoffice via where", ['path' => $path]);
+            return $path;
+        }
+
+        // Try the registry approach (more complex but thorough)
+        $registryPath = $this->findLibreOfficeFromRegistry();
+        if ($registryPath) {
+            return $registryPath;
+        }
+
+        Log::warning("LibreOffice not found in any standard location");
+        return null;
+    }
+
+    /**
+     * Find LibreOffice from Windows Registry
+     */
+    private function findLibreOfficeFromRegistry(): ?string
+    {
+        try {
+            // Try to find LibreOffice installation path from registry
+            exec('reg query "HKLM\\SOFTWARE\\LibreOffice\\UNO\\InstallPath" /ve 2>nul', $output, $exitCode);
+            if ($exitCode === 0 && !empty($output)) {
+                foreach ($output as $line) {
+                    if (strpos($line, 'REG_SZ') !== false) {
+                        $parts = explode('REG_SZ', $line);
+                        if (count($parts) > 1) {
+                            $path = trim($parts[1]) . '\\program\\soffice.exe';
+                            if (file_exists($path)) {
+                                Log::info("Found LibreOffice via registry", ['path' => $path]);
+                                return $path;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception $e) {
+            Log::debug("Registry lookup failed", ['error' => $e->getMessage()]);
+        }
+
+        return null;
+    }
+
+    /**
+     * Find any executable on Windows
+     */
+    private function findExecutable(string $name): ?string
+    {
+        // Try where command (Windows equivalent of which)
+        exec("where $name 2>nul", $output, $exitCode);
+        if ($exitCode === 0 && !empty($output)) {
+            $path = trim($output[0]);
+            Log::info("Found executable", ['name' => $name, 'path' => $path]);
+            return $path;
+        }
+
+        // Try with .exe extension
+        if (!str_ends_with($name, '.exe')) {
+            exec("where $name.exe 2>nul", $output, $exitCode);
+            if ($exitCode === 0 && !empty($output)) {
+                $path = trim($output[0]);
+                Log::info("Found executable with .exe", ['name' => $name, 'path' => $path]);
+                return $path;
+            }
+        }
+
+        Log::info("Executable not found", ['name' => $name]);
+        return null;
+    }
+
+    /**
+     * Serve PDF with proper headers for browser display
+     */
+    private function servePdf(string $pdfPath, string $originalFilename): BinaryFileResponse
+    {
+        $filename = pathinfo($originalFilename, PATHINFO_FILENAME) . '.pdf';
+
+        return response()->file($pdfPath, [
+            'Content-Type' => 'application/pdf',
+            'Content-Disposition' => 'inline; filename="' . $filename . '"',
+            'Cache-Control' => 'public, max-age=3600',
+            'X-Frame-Options' => 'SAMEORIGIN',
+        ]);
+    }
+
+    /**
+     * Enhanced MIME type detection
+     */
+    private function detectMimeType(string $filePath): string
+    {
+        // Try built-in detection first
+        if (function_exists('mime_content_type')) {
+            $mimeType = mime_content_type($filePath);
+            if ($mimeType && $mimeType !== 'application/octet-stream') {
+                return $mimeType;
+            }
+        }
+
+        // Fallback to extension mapping
+        $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+        $mimeMap = [
+            'pdf' => 'application/pdf',
+            'doc' => 'application/msword',
+            'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'xls' => 'application/vnd.ms-excel',
+            'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'ppt' => 'application/vnd.ms-powerpoint',
+            'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            'odt' => 'application/vnd.oasis.opendocument.text',
+            'ods' => 'application/vnd.oasis.opendocument.spreadsheet',
+            'odp' => 'application/vnd.oasis.opendocument.presentation',
+            'rtf' => 'application/rtf',
+            'txt' => 'text/plain',
+            'csv' => 'text/csv',
+            'html' => 'text/html',
+            'epub' => 'application/epub+zip',
+        ];
+
+        return $mimeMap[$extension] ?? 'application/octet-stream';
+    }
+
+    /**
+     * File type checks
+     */
+    private function isTextFile(string $mimeType): bool
+    {
+        return in_array($mimeType, ['text/plain', 'text/csv', 'text/html']);
+    }
+
+    private function isExcelFile(string $mimeType): bool
+    {
+        return in_array($mimeType, [
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'text/csv'
+        ]);
+    }
+
+    private function removeDirectory(string $dir): void
+    {
+        if (!file_exists($dir)) {
+            return;
+        }
+
+        $files = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST
+        );
+
+        foreach ($files as $file) {
+            $file->isDir() ? rmdir($file->getRealPath()) : unlink($file->getRealPath());
+        }
+        rmdir($dir);
+    }
+
+    /**
+     * Clean old cached PDFs (run this via cron)
+     */
+    public function cleanPdfCache(): int
+    {
+        $cacheDir = storage_path('app/pdf_cache');
+        if (!is_dir($cacheDir)) {
+            return 0;
+        }
+
+        $files = glob("$cacheDir/*.pdf");
+        $maxAge = 7 * 24 * 3600; // 7 days
+        $cleaned = 0;
+
+        foreach ($files as $file) {
+            if (filemtime($file) < time() - $maxAge) {
+                unlink($file);
+                $cleaned++;
+            }
+        }
+
+        Log::info("PDF cache cleaned", ['files_removed' => $cleaned]);
+        return $cleaned;
+    }
+
+    /**
+     * Debug method to test LibreOffice installation
+     */
+    public function debugLibreOffice()
+    {
+        $info = [
+            'os' => PHP_OS,
+            'libreoffice_path' => $this->findLibreOffice(),
+            'unoconv_path' => $this->findExecutable('unoconv'),
+            'wkhtmltopdf_path' => $this->findExecutable('wkhtmltopdf'),
+            'php_user' => get_current_user(),
+            'temp_dir_writable' => is_writable(storage_path('app/temp')),
+            'cache_dir_writable' => is_writable(storage_path('app/pdf_cache')),
+        ];
+
+        // Test LibreOffice version
+        if ($info['libreoffice_path']) {
+            exec('"' . $info['libreoffice_path'] . '" --version 2>nul', $output, $exitCode);
+            $info['libreoffice_version'] = [
+                'exit_code' => $exitCode,
+                'output' => implode("\n", $output)
+            ];
+        }
+
+        // Test unoconv version
+        if ($info['unoconv_path']) {
+            exec('"' . $info['unoconv_path'] . '" --version 2>nul', $output, $exitCode);
+            $info['unoconv_version'] = [
+                'exit_code' => $exitCode,
+                'output' => implode("\n", $output)
+            ];
+        }
+
+        Log::info("LibreOffice debug info", $info);
+        return response()->json($info);
     }
 
 
     public function download(Document $document)
     {
         if (!auth()->user()->hasDocumentPermission($document, 'download')) {
-            return response()->json(['error' => 'You don’t have permission'], 403);
-        }
-        if (!Storage::disk('local')->exists($document->path)) {
-            return response()->json(['error' => 'File not found'], 404);
+            abort(403, 'No permission');
         }
 
-        switch ($document->type) {
-            case 'jpg':
-            case 'jpeg':
-                $mimeType = 'image/jpeg';
-                break;
-            case 'png':
-                $mimeType = 'image/png';
-                break;
-            case 'pdf':
-                $mimeType = 'application/pdf';
-                break;
-            case 'doc':
-                $mimeType = 'application/msword';
-                break;
-            case 'docx':
-                $mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-                break;
-            case 'xls':
-                $mimeType = 'application/vnd.ms-excel';
-                break;
-            case 'xlsx':
-                $mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-                break;
-            case 'ppt':
-                $mimeType = 'application/vnd.ms-powerpoint';
-                break;
-            case 'pptx':
-                $mimeType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
-                break;
-            default:
-                $mimeType = 'application/octet-stream';
+        $fullPath = Storage::disk('local')->path($document->path);
+
+        if (!file_exists($fullPath)) {
+            abort(404, 'File not found');
         }
 
-        return Storage::disk('local')->response($document->path, $document->title . '.' . $document->type, [
-            'Content-Type' => $mimeType,
-            'Content-Disposition' => 'attachment; filename="' . $document->title . '.' . $document->type . '"',
+        $filename = ($document->title ?? 'document') . '.' . pathinfo($document->path, PATHINFO_EXTENSION);
+
+        return response()->file($fullPath, [
+            'Content-Disposition' => 'attachment; filename="' . $filename . '"'
         ]);
     }
-
 
     // Helper function to convert bytes to human-readable format
     private function formatBytes($bytes, $precision = 2)
