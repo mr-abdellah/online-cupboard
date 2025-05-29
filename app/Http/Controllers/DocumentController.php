@@ -58,7 +58,7 @@ class DocumentController extends Controller
         $userId = Auth::id();
         $workspaceId = $validated['workspace_id'];
         $searchTerm = $validated['search'] ?? '';
-        $fileType = $validated['file_type'];
+        $fileType = $validated['file_type'] ?? null; // ← Fixed: Use null coalescing operator
         $perPage = $validated['per_page'] ?? 10;
 
         // Check if user has access to the workspace
@@ -83,7 +83,8 @@ class DocumentController extends Controller
             })
             ->where('title', 'like', '%' . $searchTerm . '%');
 
-        if ($fileType) {
+        // ← Fixed: Check if file_type is not null AND not empty
+        if (!empty($fileType)) {
             $fileTypeMap = [
                 'image' => ['jpg', 'jpeg', 'png'],
                 'doc' => ['doc', 'docx'],
