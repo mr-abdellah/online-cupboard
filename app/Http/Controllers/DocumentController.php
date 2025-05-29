@@ -474,6 +474,60 @@ class DocumentController extends Controller
             'file_path' => $fullPath
         ]);
 
+        // Define image mime types
+        $imageMimeTypes = [
+            'image/jpeg',
+            'image/jpg',
+            'image/png',
+            'image/gif',
+            'image/webp',
+            'image/bmp',
+            'image/svg+xml'
+        ];
+
+        // Define video mime types
+        $videoMimeTypes = [
+            'video/mp4',
+            'video/avi',
+            'video/mov',
+            'video/wmv',
+            'video/webm'
+        ];
+
+        // Define text mime types
+        $textMimeTypes = [
+            'text/plain',
+            'text/html',
+            'text/css',
+            'text/javascript',
+            'application/json',
+            'application/xml'
+        ];
+
+        // Serve images directly
+        if (in_array($mimeType, $imageMimeTypes)) {
+            return response()->file($fullPath, [
+                'Content-Type' => $mimeType,
+                'Content-Disposition' => 'inline; filename="' . $document->title . '"'
+            ]);
+        }
+
+        // Serve videos directly
+        if (in_array($mimeType, $videoMimeTypes)) {
+            return response()->file($fullPath, [
+                'Content-Type' => $mimeType,
+                'Content-Disposition' => 'inline; filename="' . $document->title . '"'
+            ]);
+        }
+
+        // Serve text files directly
+        if (in_array($mimeType, $textMimeTypes)) {
+            return response()->file($fullPath, [
+                'Content-Type' => $mimeType,
+                'Content-Disposition' => 'inline; filename="' . $document->title . '"'
+            ]);
+        }
+
         // If it's already PDF, serve it directly
         if ($mimeType === 'application/pdf') {
             return $this->servePdf($fullPath, $document->title);
@@ -488,8 +542,8 @@ class DocumentController extends Controller
             }
         }
 
-        // If we can't convert, show error
-        abort(415, 'Cannot display this file type. Supported: DOC, DOCX, XLS, XLSX, PPT, PPTX, PDF, TXT');
+        // If we can't convert or display, show error
+        abort(415, 'Cannot display this file type. Supported: Images (JPG, PNG, GIF), Videos (MP4, AVI, MOV), Text files, DOC, DOCX, XLS, XLSX, PPT, PPTX, PDF');
     }
 
     /**
